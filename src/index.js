@@ -9,6 +9,7 @@ const OUTPUT_DIR = path.join(__dirname, "..", "output");
 const TIMEOUT_MS = 8000;
 const DELAY_MS = 500;
 const MAX_CATALOGUE_PAGES = 3;
+const RETRY_DELAY_MS = 1500;
 
 for (const dir of [CACHE_DIR, OUTPUT_DIR]) {
     if (!fs.existsSync(dir)) {
@@ -16,9 +17,6 @@ for (const dir of [CACHE_DIR, OUTPUT_DIR]) {
     }
 }
 
-// ----------------------------------------------------------------------
-// Stage 4 — the schema every record must satisfy before storage
-// ----------------------------------------------------------------------
 const BookSchema = z.object({
     title: z.string().min(1),
     product_url: z.string().url(),
@@ -40,17 +38,14 @@ function cacheFilenameForBookUrl(url) {
     return `book-${slug}.html`;
 }
 
-async function fetchWithCache(url, cacheFilename) {
-    const cachePath = path.join(CACHE_DIR, cacheFilename);
-
-    if (fs.existsSync(cachePath)) {
-        const html = fs.readFileSync(cachePath, "utf-8");
-        console.log(`CACHE HIT  ${url}  (${html.length} bytes)`);
-        return html;
+class FetchError extends Error {
+    constructor(message, status) {
+        super(message);
+        this.status = status;
     }
+}
 
-    await sleep(DELAY_MS);
-
+async function fetchOnce(url) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
@@ -60,19 +55,52 @@ async function fetchWithCache(url, cacheFilename) {
             headers: { "User-Agent": USER_AGENT },
             signal: controller.signal
         });
-    } finally {
+    } catch (err) {
         clearTimeout(timeoutId);
+        throw new FetchError(`Timeout fetching ${url}`, "timeout");
     }
+    clearTimeout(timeoutId);
 
     if (response.status !== 200) {
-        throw new Error(`Fetch failed for ${url}: status ${response.status}`);
+        throw new FetchError(`Fetch failed for ${url}: status ${response.status}`, response.status);
     }
 
-    const html = await response.text();
+    return response.text();
+}
+
+async function fetchWithRetry(url) {
+    try {
+        return await fetchOnce(url);
+    } catch (err) {
+        const isRetryable =
+            err.status === "timeout" || (typeof err.status === "number" && err.status >= 500);
+
+        if (!isRetryable) {
+            throw err;
+        }
+
+        console.log(`RETRY      ${url}  (after: ${err.message})`);
+        await sleep(RETRY_DELAY_MS);
+        return await fetchOnce(url);
+    }
+}
+
+async function fetchWithCache(url, cacheFilename) {
+    const cachePath = path.join(CACHE_DIR, cacheFilename);
+
+    if (fs.existsSync(cachePath)) {
+        const html = fs.readFileSync(cachePath, "utf-8");
+        console.log(`CACHE HIT  ${url}  (${html.length} bytes)`);
+        return { html, wasCacheHit: true };
+    }
+
+    await sleep(DELAY_MS);
+
+    const html = await fetchWithRetry(url);
     fs.writeFileSync(cachePath, html, "utf-8");
     console.log(`FETCH      ${url}  (${html.length} bytes)`);
 
-    return html;
+    return { html, wasCacheHit: false };
 }
 
 function parseCataloguePage(html, pageUrl) {
@@ -95,9 +123,12 @@ async function discoverAllBookLinks() {
     let pageUrl = "https://books.toscrape.com/catalogue/page-1.html";
     let pageNumber = 1;
     const allLinks = new Map();
+    let cacheHits = 0;
 
     while (pageUrl && pageNumber <= MAX_CATALOGUE_PAGES) {
-        const html = await fetchWithCache(pageUrl, `catalogue-page-${pageNumber}.html`);
+        const { html, wasCacheHit } = await fetchWithCache(pageUrl, `catalogue-page-${pageNumber}.html`);
+        if (wasCacheHit) cacheHits++;
+
         const { bookLinks, nextPageUrl } = parseCataloguePage(html, pageUrl);
 
         for (const link of bookLinks) {
@@ -110,9 +141,11 @@ async function discoverAllBookLinks() {
         pageNumber++;
     }
 
+
     return {
         cataloguePages: pageNumber - 1,
-        bookLinks: allLinks
+        bookLinks: allLinks,
+        cataloguePageCacheHits: cacheHits
     };
 }
 
@@ -142,55 +175,59 @@ function parseBookPage(html, bookUrl, sourcePageUrl) {
     };
 }
 
-// ----------------------------------------------------------------------
-// Stage 4 — normalize: turn raw strings into clean, typed values
-// ----------------------------------------------------------------------
 function normalizeRecord(raw) {
-    // "£51.77" -> 51.77. Strip everything except digits and the
-    // decimal point before parsing, since parseFloat/Number can't
-    // handle a leading currency symbol on their own.
     const numericPrice = parseFloat(raw.price_text.replace(/[^0-9.]/g, ""));
-
-    return {
-        ...raw,
-        price_gbp: numericPrice
-    };
+    return { ...raw, price_gbp: numericPrice };
 }
 
 async function main() {
-    const { cataloguePages, bookLinks } = await discoverAllBookLinks();
+    const startTime = Date.now();
+
+    const { cataloguePages, bookLinks, cataloguePageCacheHits } = await discoverAllBookLinks();
 
     console.log(`catalogue_pages=${cataloguePages}`);
     console.log(`discovered=${bookLinks.size}`);
 
-    // Keyed by product_url (the canonical identity) so that if the
-    // same book URL ever appeared twice in our link list, it would
-    // naturally collapse to a single entry here.
     const validRecords = new Map();
     const errors = [];
+    let bookPageCacheHits = 0;
+    let failedPages = 0;
 
     for (const [bookUrl, sourcePageUrl] of bookLinks) {
-        const cacheFilename = cacheFilenameForBookUrl(bookUrl);
-        const html = await fetchWithCache(bookUrl, cacheFilename);
-        const raw = parseBookPage(html, bookUrl, sourcePageUrl);
-        const normalized = normalizeRecord(raw);
+        try {
+            const cacheFilename = cacheFilenameForBookUrl(bookUrl);
+            const { html, wasCacheHit } = await fetchWithCache(bookUrl, cacheFilename);
+            if (wasCacheHit) bookPageCacheHits++;
 
-        const result = BookSchema.safeParse(normalized);
-        if (result.success) {
-            validRecords.set(normalized.product_url, result.data);
-        } else {
+            const raw = parseBookPage(html, bookUrl, sourcePageUrl);
+            const normalized = normalizeRecord(raw);
+
+            const result = BookSchema.safeParse(normalized);
+            if (result.success) {
+                validRecords.set(normalized.product_url, result.data);
+            } else {
+                errors.push({
+                    product_url: normalized.product_url,
+                    reason: result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")
+                });
+            }
+        } catch (err) {
+            failedPages++;
             errors.push({
-                product_url: normalized.product_url,
-                reason: result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")
+                product_url: bookUrl,
+                reason: err.message
             });
+            console.log(`FAILED     ${bookUrl}  (${err.message})`);
         }
     }
 
     const books = Array.from(validRecords.values());
+    const durationMs = Date.now() - startTime;
 
     console.log(`detail_pages=${bookLinks.size}`);
     console.log(`valid_records=${books.length}`);
     console.log(`invalid_records=${errors.length}`);
+    console.log(`failed_pages=${failedPages}`);
 
     fs.writeFileSync(
         path.join(OUTPUT_DIR, "books.json"),
@@ -200,6 +237,26 @@ async function main() {
         path.join(OUTPUT_DIR, "errors.json"),
         JSON.stringify(errors, null, 2)
     );
+
+    const runReport = {
+        start_time: new Date(startTime).toISOString(),
+        duration_ms: durationMs,
+        catalogue_pages_fetched: cataloguePages,
+        catalogue_page_cache_hits: cataloguePageCacheHits,
+        book_pages_discovered: bookLinks.size,
+        book_page_cache_hits: bookPageCacheHits,
+        valid_records: books.length,
+        invalid_records: errors.length,
+        failed_pages: failedPages
+    };
+
+    fs.writeFileSync(
+        path.join(OUTPUT_DIR, "run-report.json"),
+        JSON.stringify(runReport, null, 2)
+    );
+
+    console.log("\nRun report:");
+    console.log(JSON.stringify(runReport, null, 2));
 }
 
 main().catch((err) => {
