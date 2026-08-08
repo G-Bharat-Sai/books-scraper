@@ -19,6 +19,7 @@
   },
   "homepage": "https://github.com/G-Bharat-Sai/books-scraper#readme",
   "dependencies": {
-    "cheerio": "^1.2.0"
+    "cheerio": "^1.2.0",
+    "zod": "^4.4.3"
   }
 }

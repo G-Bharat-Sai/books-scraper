@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const cheerio = require("cheerio");
+const { z } = require("zod");
 
 const USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/G-Bharat-Sai/books-scraper)";
 const CACHE_DIR = path.join(__dirname, "..", "cache");
@@ -15,12 +16,25 @@ for (const dir of [CACHE_DIR, OUTPUT_DIR]) {
     }
 }
 
+// ----------------------------------------------------------------------
+// Stage 4 — the schema every record must satisfy before storage
+// ----------------------------------------------------------------------
+const BookSchema = z.object({
+    title: z.string().min(1),
+    product_url: z.string().url(),
+    price_text: z.string().min(1),
+    price_gbp: z.number().positive(),
+    availability_text: z.string().min(1),
+    rating_text: z.string().min(1),
+    description: z.string().nullable(),
+    source_page: z.string().url(),
+    fetched_at: z.string().datetime()
+});
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Turns a book detail URL into a safe, unique cache filename, e.g.
-// "https://.../a-light-in-the-attic_1000/index.html" -> "book-a-light-in-the-attic_1000.html"
 function cacheFilenameForBookUrl(url) {
     const slug = url.split("/").filter(Boolean).slice(-2)[0];
     return `book-${slug}.html`;
@@ -80,7 +94,7 @@ function parseCataloguePage(html, pageUrl) {
 async function discoverAllBookLinks() {
     let pageUrl = "https://books.toscrape.com/catalogue/page-1.html";
     let pageNumber = 1;
-    const allLinks = new Map(); // bookUrl -> sourcePageUrl
+    const allLinks = new Map();
 
     while (pageUrl && pageNumber <= MAX_CATALOGUE_PAGES) {
         const html = await fetchWithCache(pageUrl, `catalogue-page-${pageNumber}.html`);
@@ -98,13 +112,10 @@ async function discoverAllBookLinks() {
 
     return {
         cataloguePages: pageNumber - 1,
-        bookLinks: allLinks // Map of bookUrl -> which catalogue page it came from
+        bookLinks: allLinks
     };
 }
 
-// Aims selectors at the product's own info box, not the whole page,
-// so a description/comments/related-books section elsewhere on the
-// page can never accidentally be picked up as "the price."
 function parseBookPage(html, bookUrl, sourcePageUrl) {
     const $ = cheerio.load(html);
     const product = $(".product_main");
@@ -116,8 +127,6 @@ function parseBookPage(html, bookUrl, sourcePageUrl) {
     const ratingClass = product.find(".star-rating").attr("class") || "";
     const ratingText = ratingClass.replace("star-rating", "").trim();
 
-    // Description section is entirely absent for some books — store
-    // null rather than an empty string or invented text.
     const descriptionEl = $("#product_description").next("p");
     const description = descriptionEl.length ? descriptionEl.text().trim() : null;
 
@@ -133,27 +142,63 @@ function parseBookPage(html, bookUrl, sourcePageUrl) {
     };
 }
 
+// ----------------------------------------------------------------------
+// Stage 4 — normalize: turn raw strings into clean, typed values
+// ----------------------------------------------------------------------
+function normalizeRecord(raw) {
+    // "£51.77" -> 51.77. Strip everything except digits and the
+    // decimal point before parsing, since parseFloat/Number can't
+    // handle a leading currency symbol on their own.
+    const numericPrice = parseFloat(raw.price_text.replace(/[^0-9.]/g, ""));
+
+    return {
+        ...raw,
+        price_gbp: numericPrice
+    };
+}
+
 async function main() {
     const { cataloguePages, bookLinks } = await discoverAllBookLinks();
 
     console.log(`catalogue_pages=${cataloguePages}`);
     console.log(`discovered=${bookLinks.size}`);
 
-    const records = [];
+    // Keyed by product_url (the canonical identity) so that if the
+    // same book URL ever appeared twice in our link list, it would
+    // naturally collapse to a single entry here.
+    const validRecords = new Map();
+    const errors = [];
+
     for (const [bookUrl, sourcePageUrl] of bookLinks) {
         const cacheFilename = cacheFilenameForBookUrl(bookUrl);
         const html = await fetchWithCache(bookUrl, cacheFilename);
-        const record = parseBookPage(html, bookUrl, sourcePageUrl);
-        records.push(record);
+        const raw = parseBookPage(html, bookUrl, sourcePageUrl);
+        const normalized = normalizeRecord(raw);
+
+        const result = BookSchema.safeParse(normalized);
+        if (result.success) {
+            validRecords.set(normalized.product_url, result.data);
+        } else {
+            errors.push({
+                product_url: normalized.product_url,
+                reason: result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")
+            });
+        }
     }
 
-    console.log(`detail_pages=${records.length}`);
-    console.log("\nSample record:");
-    console.log(JSON.stringify(records[0], null, 2));
+    const books = Array.from(validRecords.values());
+
+    console.log(`detail_pages=${bookLinks.size}`);
+    console.log(`valid_records=${books.length}`);
+    console.log(`invalid_records=${errors.length}`);
 
     fs.writeFileSync(
-        path.join(OUTPUT_DIR, "raw-records.json"),
-        JSON.stringify(records, null, 2)
+        path.join(OUTPUT_DIR, "books.json"),
+        JSON.stringify(books, null, 2)
+    );
+    fs.writeFileSync(
+        path.join(OUTPUT_DIR, "errors.json"),
+        JSON.stringify(errors, null, 2)
     );
 }
 
